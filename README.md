@@ -39,7 +39,7 @@ A Chrome extension that turns any web page or YouTube video into a study session
 Requires Node.js 20+.
 
 ```bash
-git clone https://github.com/<your-username>/my-ai-notes.git
+git clone https://github.com/hashmat-shaik/my-ai-notes.git
 cd my-ai-notes
 npm install
 npm run dev
