@@ -7,6 +7,8 @@ export type Message = {
   ts: number
   pinned?: boolean // flagged "add to notes"
   partial?: boolean // the user pressed Stop
+  pageUrl?: string // normalized URL of the page this answer was about
+  pageTitle?: string
 }
 
 export type Session = {
@@ -59,11 +61,17 @@ export function siteKey(raw: string) {
 }
 
 export async function listSessions(): Promise<Session[]> {
-  const all = await chrome.storage.local.get(null)
+  const all = (await chrome.storage.local.get(null)) as unknown as Record<string, unknown>
   return Object.entries(all)
     .filter(([k]) => k.startsWith(PREFIX))
     .map(([, v]) => v as Session)
     .sort((a, b) => b.updatedAt - a.updatedAt)
+}
+
+export async function getSession(id: string): Promise<Session | undefined> {
+  const key = PREFIX + id
+  const all = (await chrome.storage.local.get(key)) as Record<string, Session | undefined>
+  return all[key]
 }
 
 export async function saveSession(s: Session) {

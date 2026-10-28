@@ -36,6 +36,9 @@ import { listSessions, saveSession, type Session } from "../lib/sessions"
 
 const NOTE_BUDGET = 60000 // chars of note sent in full; larger notes send outline + relevant sections
 const PIN_ANSWER_CAP = 6000
+const PIN_TOTAL_BUDGET = 90000 // chars of pinned answers per merge, so one message stays within chat limits
+const MAX_PINS_PER_MERGE = 30
+const pinCap = (n: number) => Math.max(800, Math.min(PIN_ANSWER_CAP, Math.floor(PIN_TOTAL_BUDGET / Math.max(1, n))))
 
 type Pin = {
   id: string
@@ -54,7 +57,7 @@ function collectPins(sessions: Session[]): Pin[] {
     s.messages.forEach((m, i) => {
       if (m.role !== "assistant" || !m.pinned) return
       const prev = s.messages[i - 1]
-      const url = s.contextUrl || s.pageUrl
+      const url = m.pageUrl || s.contextUrl || s.pageUrl
       let host = ""
       try {
         host = new URL(url).hostname.replace(/^www\./, "")
@@ -64,7 +67,7 @@ function collectPins(sessions: Session[]): Pin[] {
         sessionId: s.id,
         question: prev?.role === "user" ? prev.content : "(question not found)",
         answer: m.content,
-        pageTitle: s.title,
+        pageTitle: m.pageTitle || s.title,
         pageUrl: url,
         host,
         ts: m.ts
@@ -325,7 +328,13 @@ export default function NotesPage() {
     let last: Note | null = null
     let count = 0
     for (const f of Array.from(files)) {
-      const text = await f.text()
+      let text = ""
+      try {
+        text = await f.text()
+      } catch {
+        showToast(`Couldn't read ${f.name}.`)
+        continue
+      }
       if (/\.json$/i.test(f.name)) {
         try {
           const data = JSON.parse(text)
@@ -339,8 +348,12 @@ export default function NotesPage() {
           showToast(`${f.name} isn't a valid backup file.`)
         }
       } else {
-        last = await createNote(unique(f.name.replace(/\.(md|markdown|txt)$/i, "")), text)
-        count++
+        try {
+          last = await createNote(unique(f.name.replace(/\.(md|markdown|txt)$/i, "")), text)
+          count++
+        } catch {
+          showToast(`Couldn't import ${f.name}.`)
+        }
       }
     }
     if (fileRef.current) fileRef.current.value = ""
@@ -404,9 +417,11 @@ export default function NotesPage() {
       ta.setSelectionRange(h.offset, h.offset + h.length)
       ta.scrollTop = Math.max(0, (h.offset / Math.max(1, ta.value.length)) * ta.scrollHeight - 60)
     } else {
-      previewRef.current
-        ?.querySelectorAll("h1,h2,h3,h4,h5,h6")
-        [h.idx]?.scrollIntoView({ behavior: "smooth", block: "start" })
+      const els = Array.from(previewRef.current?.querySelectorAll("h1,h2,h3,h4,h5,h6") ?? [])
+      const clean = (s: string) => s.replace(/[*_`]/g, "").replace(/\s+/g, " ").trim().toLowerCase()
+      const nth = headings.filter((x) => x.idx < h.idx && clean(x.text) === clean(h.text)).length
+      const same = els.filter((el) => clean(el.textContent || "") === clean(h.text))
+      ;(same[nth] ?? els[h.idx])?.scrollIntoView({ behavior: "smooth", block: "start" })
     }
   }
 
@@ -437,7 +452,7 @@ export default function NotesPage() {
 
   const estTokens = useMemo(() => {
     const noteChars = Math.min(content.length, NOTE_BUDGET)
-    const pinChars = selectedPins.reduce((n, p) => n + p.question.length + Math.min(p.answer.length, PIN_ANSWER_CAP), 0)
+    const pinChars = selectedPins.reduce((n, p) => n + p.question.length + Math.min(p.answer.length, pinCap(selectedPins.length)), 0)
     return Math.round((noteChars + pinChars + 1800) / 4)
   }, [content, selectedPins])
 
@@ -447,6 +462,10 @@ export default function NotesPage() {
     if (!draftRef.current || merge.phase === "running") return
     const chosen = selectedPins
     if (!chosen.length) return
+    if (chosen.length > MAX_PINS_PER_MERGE) {
+      showToast(`Select at most ${MAX_PINS_PER_MERGE} pins per merge, then run it again for the rest.`)
+      return
+    }
     await flush()
     setShowRight(true)
     setLastMerge(null)
@@ -455,7 +474,7 @@ export default function NotesPage() {
     const inputs: PinInput[] = chosen.map((p, i) => ({
       n: i + 1,
       question: p.question,
-      answer: p.answer.slice(0, PIN_ANSWER_CAP),
+      answer: p.answer.slice(0, pinCap(chosen.length)),
       title: p.pageTitle,
       url: p.pageUrl,
       date: ymd(p.ts)
@@ -480,7 +499,7 @@ export default function NotesPage() {
         onStatus: (status) => setMerge((m) => (m.phase === "running" ? { ...m, status } : m))
       })
 
-      if (!res.ok) {
+      if (res.ok === false) {
         setMerge(res.error === "Stopped." ? { phase: "idle" } : { phase: "error", message: res.error })
         return
       }
@@ -501,7 +520,9 @@ export default function NotesPage() {
       }
 
       // Check against the note as it is NOW (you may have kept typing while it ran).
-      const items = validateItems(draftRef.current?.content ?? note.content, parsed)
+      const current =
+        draftRef.current?.id === note.id ? draftRef.current.content : (await getNote(note.id))?.content
+      const items = validateItems(current ?? note.content, parsed)
       const init: Record<string, boolean> = {}
       for (const it of items) {
         // Suspected duplicates and unlocatable refinements start unchecked: strictness is the point.
@@ -575,11 +596,16 @@ export default function NotesPage() {
     const lm = lastMerge
     if (!lm) return
     if (draftRef.current?.id !== lm.noteId) await openNote(lm.noteId)
+    await flush()
+    if (draftRef.current && draftRef.current.content !== lm.snapshot) {
+      // Edits made after the merge would be lost; keep them in Version history.
+      await addSnapshot(draftRef.current.id, draftRef.current.content, "Before undoing a merge")
+    }
     edit({ content: lm.snapshot })
     await flush()
     for (const p of lm.unpinned) await setPinned(p, true)
     setLastMerge(null)
-    showToast("Merge undone.")
+    showToast("Merge undone. Anything you typed since is in Version history.")
   }
 
   /* ----- version history ----- */

@@ -121,10 +121,22 @@ async function askInPage(prompt: string, cfg: ProviderCfg, timeoutMs: number, sl
       } catch {}
     }
 
-    const before = qAll(cfg.sel.response).length
+    let before = qAll(cfg.sel.response).length
 
     // 1. Find the input and put the prompt in it.
     const input = await waitFor(() => q(cfg.sel.input), 30000, "the chat input", "You may be logged out. ")
+
+    // A resumed chat renders its history asynchronously. Wait until the message count stops changing,
+    // otherwise an old message that appears later would be mistaken for the new reply.
+    for (let i = 0, stable = 0; i < 12 && stable < 3; i++) {
+      await sleep(300)
+      const n = qAll(cfg.sel.response).length
+      if (n === before) stable++
+      else {
+        before = n
+        stable = 0
+      }
+    }
     input.focus()
     document.execCommand("selectAll", false) // clear any leftover draft
     document.execCommand("delete", false)
@@ -148,6 +160,7 @@ async function askInPage(prompt: string, cfg: ProviderCfg, timeoutMs: number, sl
       10000,
       "the send button"
     )
+    before = qAll(cfg.sel.response).length
     sendBtn.click()
 
     // 3. Wait for the new assistant message to appear.
@@ -172,6 +185,7 @@ async function askInPage(prompt: string, cfg: ProviderCfg, timeoutMs: number, sl
     let lastText = ""
     let lastChange = Date.now()
     const start = Date.now()
+    let finished = false
     while (!stopped && Date.now() - start < timeoutMs) {
       const el = getLast()
       const text = (el?.innerText || "").trim()
@@ -184,15 +198,20 @@ async function askInPage(prompt: string, cfg: ProviderCfg, timeoutMs: number, sl
       }
       const streaming = !!q(cfg.sel.stop)
       heartbeat("streaming", Date.now() - lastChange)
-      if (text && !streaming && Date.now() - lastChange > 2500) break
+      if (text && !streaming && Date.now() - lastChange > 2500) {
+        finished = true
+        break
+      }
       await sleep(500)
     }
+    // Ran out of time while still streaming: hand back what we have, flagged as partial, not as complete.
+    const timedOut = !stopped && !finished
     if (stopped) await sleep(600) // let the last tokens render
 
     const el = getLast()
     const html = el?.innerHTML || ""
     if (!(el?.innerText || "").trim()) return { ok: false, error: stopped ? "Stopped." : "The response came back empty." }
-    return { ok: true, html, stopped }
+    return { ok: true, html, stopped: stopped || timedOut }
   } catch (e: any) {
     return { ok: false, error: e?.message || String(e) }
   } finally {

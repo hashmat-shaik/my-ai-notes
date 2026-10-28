@@ -13,13 +13,18 @@ export type Heading = { level: number; text: string; offset: number; length: num
 /** Headings of the markdown, ignoring anything inside ``` fences. */
 export function parseHeadings(md: string): Heading[] {
   const out: Heading[] = []
-  let inFence = false
+  let fence: { ch: string; len: number } | null = null
   let offset = 0
   md.split("\n").forEach((line) => {
-    if (/^\s{0,3}(```|~~~)/.test(line)) {
-      inFence = !inFence
-    } else if (!inFence) {
-      const m = /^(#{1,6})\s+(.+?)\s*#*\s*$/.exec(line)
+    const f = /^ {0,3}(`{3,}|~{3,})/.exec(line)
+    if (fence) {
+      // A closing fence uses the same character and is at least as long as the opener.
+      if (f && f[1][0] === fence.ch && f[1].length >= fence.len && /^ {0,3}[`~]+\s*$/.test(line)) fence = null
+    } else if (f) {
+      fence = { ch: f[1][0], len: f[1].length }
+    } else {
+      // A closing "#" sequence only counts when preceded by a space ("## C#" is the heading "C#").
+      const m = /^ {0,3}(#{1,6})\s+(.+?)(?:\s+#+)?\s*$/.exec(line)
       if (m) {
         out.push({ level: m[1].length, text: m[2].replace(/[*_`]/g, ""), offset, length: line.length, idx: out.length })
       }
@@ -38,7 +43,8 @@ export function findHeading(headings: Heading[], name: string): Heading | undefi
     headings.find((h) => norm(h.text) === n) ??
     headings.find((h) => {
       const t = norm(h.text)
-      return t.includes(n) || (t.length >= 4 && n.includes(t))
+      const has = (hay: string, needle: string) => ` ${hay} `.includes(` ${needle} `)
+      return has(t, n) || (t.length >= 4 && has(n, t))
     })
   )
 }
@@ -83,7 +89,7 @@ const STOP = new Set([
 ])
 
 function keywords(text: string): Set<string> {
-  return new Set((text.toLowerCase().match(/[a-z]{5,}/g) ?? []).filter((w) => !STOP.has(w)))
+  return new Set((text.toLowerCase().match(/[\p{L}\p{M}\p{N}]{5,}/gu) ?? []).filter((w) => !STOP.has(w)))
 }
 
 /**
@@ -99,6 +105,39 @@ export function buildNoteContext(content: string, pins: PinInput[], budget = 600
   const firstStart = cuts.length ? cuts[0].offset : content.length
   if (firstStart > 0) sections.push({ start: 0, end: firstStart })
   cuts.forEach((h, i) => sections.push({ start: h.offset, end: cuts[i + 1]?.offset ?? content.length }))
+
+  // A section too big to be useful on its own is split at deeper headings / blank lines.
+  const maxLen = Math.floor(budget / 4)
+  const split = (start: number, end: number) => {
+    if (end - start <= maxLen) return [{ start, end }]
+    const bounds = new Set<number>()
+    headings.forEach((h) => h.offset > start && h.offset < end && bounds.add(h.offset))
+    const re = /\n\s*\n/g
+    const text = content.slice(start, end)
+    let m: RegExpExecArray | null
+    while ((m = re.exec(text))) bounds.add(start + m.index + m[0].length)
+    const pts = [...bounds].sort((a, b) => a - b)
+    const parts: { start: number; end: number }[] = []
+    let cur = start
+    let last = -1
+    for (const p of pts) {
+      if (p - cur > maxLen) {
+        if (last > cur) {
+          parts.push({ start: cur, end: last })
+          cur = last
+        } else {
+          parts.push({ start: cur, end: p })
+          cur = p
+        }
+      }
+      last = p
+    }
+    parts.push({ start: cur, end })
+    return parts
+  }
+  const pieces = sections.flatMap((s) => split(s.start, s.end))
+  sections.length = 0
+  sections.push(...pieces)
 
   const outline = headings.map((h) => `${"#".repeat(h.level)} ${h.text}`).join("\n")
   const kw = keywords(pins.map((p) => `${p.question} ${p.answer}`).join(" "))
@@ -123,10 +162,16 @@ export function buildNoteContext(content: string, pins: PinInput[], budget = 600
     used += len
   }
 
-  const body = sections
+  let body = sections
     .filter((_, i) => chosen.has(i))
     .map((s) => content.slice(s.start, s.end).trimEnd())
     .join("\n\n")
+  if (!chosen.size && scored.length) {
+    // Even the smallest piece didn't fit: send the start of the best match rather than nothing.
+    const top = scored[0].s
+    body = content.slice(top.start, top.start + Math.max(1000, budget - used)).trimEnd()
+    chosen.add(scored[0].i)
+  }
 
   return {
     text: `FULL OUTLINE OF THE NOTES:\n${outline}\n\nSECTIONS MOST RELEVANT TO THE NEW MATERIAL (others omitted):\n\n${body}`,
@@ -274,7 +319,7 @@ function tokens(s: string): Set<string> {
   return new Set(
     s
       .toLowerCase()
-      .replace(/[^a-z0-9\s]/g, " ")
+      .replace(/[^\p{L}\p{M}\p{N}\s]/gu, " ")
       .split(/\s+/)
       .filter((w) => w.length > 2 && !STOP.has(w))
   )
@@ -307,7 +352,8 @@ export function validateItems(content: string, items: Omit<MergeItem, "status">[
   const headings = parseHeadings(content)
   return items.map((it) => {
     const out: MergeItem = { ...it, status: "ok" }
-    const h = it.section ? findHeading(headings, it.section) : undefined
+    let h = it.section ? findHeading(headings, it.section) : undefined
+    if (!h && it.newSection) h = headings.find((x) => norm(x.text) === norm(it.newSection!.title))
 
     const placeNew = () => {
       if (h) {
@@ -347,7 +393,8 @@ function sourceLine(it: MergeItem, pinMeta: Map<number, PinMeta>): string {
   const pm = it.pins.map((n) => pinMeta.get(n)).find(Boolean)
   if (!pm) return ""
   const title = (pm.title || "source").replace(/[\[\]]/g, "").trim()
-  return pm.url ? `Source: [${title}](${pm.url}), ${pm.date}` : `Source: ${title}, ${pm.date}`
+  const url = pm.url.replace(/ /g, "%20").replace(/\(/g, "%28").replace(/\)/g, "%29")
+  return pm.url ? `Source: [${title}](${url}), ${pm.date}` : `Source: ${title}, ${pm.date}`
 }
 
 /** The exact text that will be inserted for a NEW item (also used to preview it). */
@@ -405,10 +452,11 @@ export function applyItems(
     const headings = parseHeadings(doc)
     let h = it.targetIdx != null ? headings[it.targetIdx] : undefined
     if (h && it.section && norm(h.text) !== norm(it.section)) h = findHeading(headings, it.section) // note changed meanwhile
+    const ns = it.newSection ?? { level: 2, title: it.section || "New topic" }
+    // An earlier item in this batch (or the note itself) may already have this section.
+    if (!h) h = headings.find((x) => norm(x.text) === norm(ns.title))
     const block = blockFor(it, pinMeta)
-    doc = h
-      ? insertUnder(doc, headings, h, block)
-      : insertNewSection(doc, headings, it.newSection ?? { level: 2, title: it.section || "New topic" }, block)
+    doc = h ? insertUnder(doc, headings, h, block) : insertNewSection(doc, headings, ns, block)
     applied.push(it.id)
   }
 
